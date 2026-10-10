@@ -1,6 +1,7 @@
+import { timingSafeEqual } from 'node:crypto'
 import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/automations/admin-client'
-import { resumePendingExecution } from '@/lib/automations/engine'
+import { expireAwaitingReplies, resumePendingExecution } from '@/lib/automations/engine'
 import type { AutomationContext } from '@/lib/automations/engine'
 
 /**
@@ -19,10 +20,20 @@ export async function GET(request: Request) {
   if (!expected) {
     return NextResponse.json({ error: 'cron not configured' }, { status: 503 })
   }
-  const supplied = request.headers.get('x-cron-secret')
-  if (supplied !== expected) {
+  const supplied = request.headers.get('x-cron-secret') ?? ''
+  const suppliedBuf = Buffer.from(supplied)
+  const expectedBuf = Buffer.from(expected)
+  if (
+    suppliedBuf.length !== expectedBuf.length ||
+    !timingSafeEqual(suppliedBuf, expectedBuf)
+  ) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+
+  // Close out wait_for_reply runs whose 24h reply window lapsed. The
+  // webhook already refuses to resume them; this just settles their
+  // status and explains the outcome on the log.
+  const expired = await expireAwaitingReplies()
 
   const admin = supabaseAdmin()
   const { data: due, error } = await admin
@@ -34,7 +45,7 @@ export async function GET(request: Request) {
     .limit(50)
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  if (!due || due.length === 0) return NextResponse.json({ processed: 0 })
+  if (!due || due.length === 0) return NextResponse.json({ processed: 0, expired })
 
   let processed = 0
   for (const row of due) {
@@ -64,5 +75,5 @@ export async function GET(request: Request) {
     processed++
   }
 
-  return NextResponse.json({ processed })
+  return NextResponse.json({ processed, expired })
 }
